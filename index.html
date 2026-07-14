@@ -25,8 +25,9 @@
 
 <script>
 /**
- * PURE CANVAS 4-TRACK ENGINE v8
+ * PURE CANVAS 4-TRACK ENGINE v8.1
  * Hardware UI Overhaul, Chunky Faders, Latency Compensation
+ * PERFORMANCE OPTIMIZED: State-based rendering
  */
 
 const canvas = document.getElementById('app');
@@ -43,6 +44,9 @@ let lastDrawTime = 0;
 let animationFrameId;
 let currentBPM = 120;
 let isSnapEnabled = true; 
+
+// OPTIMIZATION: Render state flag
+let needsRender = true;
 
 // LATENCY COMPENSATION STATE (in milliseconds)
 let globalLatencyMs = 150; 
@@ -75,7 +79,10 @@ let activeColorTrackId = null;
 colorPicker.addEventListener('input', (e) => {
   if (activeColorTrackId) {
     const track = tracks.find(t => t.id === activeColorTrackId);
-    if (track) track.color = e.target.value;
+    if (track) {
+        track.color = e.target.value;
+        needsRender = true;
+    }
   }
 });
 
@@ -87,9 +94,9 @@ const tracks = [
 ];
 
 const TOP_BAR_H = 70;
-const LEFT_PANEL_W = 200; // Expanded to fit massive faders
+const LEFT_PANEL_W = 200; 
 const TIMELINE_H = 40;
-const TRACK_H = 140; // Expanded for hardware faders
+const TRACK_H = 140; 
 const SCROLLBAR_H = 15;
 
 let mouseX = 0;
@@ -108,6 +115,7 @@ function resize() {
   height = window.innerHeight;
   canvas.width = width;
   canvas.height = height;
+  needsRender = true;
 }
 window.addEventListener('resize', resize);
 resize();
@@ -223,6 +231,7 @@ async function exportMixdown() {
   const offlineReverbIR = generateReverbIR(3.0, 3.5, offlineCtx);
 
   isMixing = true;
+  needsRender = true;
 
   tracks.forEach(track => {
     const tGain = offlineCtx.createGain();
@@ -267,6 +276,7 @@ async function exportMixdown() {
   }
 
   isMixing = false;
+  needsRender = true;
 }
 
 window.addEventListener('keydown', (e) => {
@@ -286,6 +296,7 @@ window.addEventListener('keydown', (e) => {
           track.clips.push(newClip);
           selectedClip = newClip; 
           clipboardClip = newClip; 
+          needsRender = true;
         }
       }
     }
@@ -315,12 +326,14 @@ fileInput.onchange = async (e) => {
   
   e.target.value = '';
   activeLoadTrackId = null;
+  needsRender = true;
 };
 
 function playAudio() {
   initAudioContext();
   if (isPlaying) return;
   isPlaying = true;
+  needsRender = true;
   lastDrawTime = audioCtx.currentTime;
   
   tracks.forEach(track => {
@@ -344,6 +357,7 @@ function playAudio() {
 function stopAudio() {
   isPlaying = false;
   isRecording = false;
+  needsRender = true;
   
   if (mediaRecorder && mediaRecorder.state === "recording") {
     mediaRecorder.stop();
@@ -403,9 +417,11 @@ async function recordAudio() {
     armedTrack.clips.push(newClip);
     selectedClip = newClip;
     armedTrack.livePixels = [];
+    needsRender = true;
   };
 
   isRecording = true;
+  needsRender = true;
   playAudio();
   mediaRecorder.start();
 }
@@ -416,7 +432,6 @@ function drawRect(x, y, w, h, radius, fill) {
   if (fill) { ctx.fillStyle = fill; ctx.fill(); }
 }
 
-// HARDWARE SQUARE RUBBER BUTTON
 function drawSquareButton(id, x, y, w, h, text, isActive, colorStr) {
   activeButtons[id] = { x, y, w, h };
   const isHover = mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + h;
@@ -427,23 +442,18 @@ function drawSquareButton(id, x, y, w, h, text, isActive, colorStr) {
   ctx.save();
   if (isPressed && !isActive) ctx.translate(0, 2);
 
-  // Beveled edge drawing
   drawRect(x, y, w, h, 4, baseColor);
   
   if (!isPressed && !isActive) {
-    // 3D Top Highlight
     ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
     drawRect(x, y, w, h/2, 4);
-    // 3D Bottom Shadow
     ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
     drawRect(x, y + h/2, w, h/2, 4);
   } else {
-    // Inset shadow for active/pressed
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     drawRect(x, y, w, h, 4);
   }
   
-  // Border
   ctx.lineWidth = 1;
   ctx.strokeStyle = isPressed || isActive ? '#000' : '#333';
   ctx.strokeRect(x, y, w, h);
@@ -456,18 +466,15 @@ function drawSquareButton(id, x, y, w, h, text, isActive, colorStr) {
   ctx.restore();
 }
 
-// CHUNKY MACRO FADER
 function drawMacroFader(id, x, y, w, h, value, color, label) {
   activeButtons[id] = { x, y: y - 10, w, h: h + 20 };
   
-  // Fader Track Background (Chunky)
   ctx.fillStyle = '#0a0b0d';
   drawRect(x, y, w, h, 2, '#0a0b0d');
   ctx.lineWidth = 1;
   ctx.strokeStyle = '#222';
   ctx.strokeRect(x, y, w, h);
 
-  // Filled Color Track
   const fillW = value * w;
   ctx.fillStyle = color;
   ctx.shadowBlur = 8;
@@ -475,12 +482,10 @@ function drawMacroFader(id, x, y, w, h, value, color, label) {
   drawRect(x, y, fillW, h, 2, color);
   ctx.shadowBlur = 0;
 
-  // Solid Thumb Grabber
   const thumbX = x + fillW;
   ctx.fillStyle = '#ddd';
   drawRect(thumbX - 6, y - 4, 12, h + 8, 2, '#ddd');
   
-  // Grip Lines
   ctx.fillStyle = '#333';
   ctx.fillRect(thumbX - 2, y + h/2 - 4, 1, 8);
   ctx.fillRect(thumbX + 1, y + h/2 - 4, 1, 8);
@@ -492,6 +497,13 @@ function drawMacroFader(id, x, y, w, h, value, color, label) {
 }
 
 function render() {
+  // OPTIMIZATION: Stop loop execution if nothing has changed and not actively playing
+  if (!isPlaying && !isRecording && !needsRender) {
+    requestAnimationFrame(render);
+    return;
+  }
+  needsRender = false;
+
   const chassisGrad = ctx.createLinearGradient(0, 0, 0, height);
   chassisGrad.addColorStop(0, '#121418');
   chassisGrad.addColorStop(1, '#08090a');
@@ -519,14 +531,12 @@ function render() {
     }
   }
 
-  // --- SCROLLABLE TIMELINE & WAVES ---
   ctx.save();
   ctx.beginPath();
   ctx.rect(LEFT_PANEL_W, TOP_BAR_H, width - LEFT_PANEL_W, height - TOP_BAR_H - SCROLLBAR_H);
   ctx.clip();
   ctx.translate(LEFT_PANEL_W - viewOffsetX, TOP_BAR_H);
 
-  // Subtle Timeline background
   ctx.fillStyle = '#060708';
   ctx.fillRect(0, 0, TOTAL_DURATION * zoomLevel, TIMELINE_H);
   ctx.strokeStyle = '#1a1c20';
@@ -652,7 +662,6 @@ function render() {
   ctx.shadowBlur = 0;
   ctx.restore(); 
 
-  // --- LEFT PANEL (Hardware Zone) ---
   ctx.fillStyle = '#101216';
   ctx.fillRect(0, TOP_BAR_H, LEFT_PANEL_W, height - TOP_BAR_H);
   ctx.strokeStyle = '#000';
@@ -662,7 +671,6 @@ function render() {
   tracks.forEach((track, i) => {
     const trackY = TOP_BAR_H + TIMELINE_H + (i * (TRACK_H + 10));
     
-    // Panel inset backing
     ctx.fillStyle = '#0d0f12';
     drawRect(10, trackY + 5, LEFT_PANEL_W - 20, TRACK_H - 10, 6);
     
@@ -679,12 +687,10 @@ function render() {
     drawSquareButton(`arm_${track.id}`, 20, trackY + 35, 60, 25, "ARM", track.armed, "#ff0033");
     drawSquareButton(`load_${track.id}`, 90, trackY + 35, 60, 25, "LOAD", false, "");
 
-    // Massive Hardware Faders
     drawMacroFader(`vol_${track.id}`, 20, trackY + 85, 140, 14, track.volume / 2, '#00ffff', 'LEVEL');
     drawMacroFader(`rev_${track.id}`, 20, trackY + 115, 140, 14, track.reverb, '#ff00ff', 'REVERB');
   });
 
-  // --- CUSTOM SCROLLBAR ---
   const scrollbarTrackW = width - LEFT_PANEL_W;
   const scrollbarTrackY = height - SCROLLBAR_H;
   ctx.fillStyle = '#08090a';
@@ -702,7 +708,6 @@ function render() {
     activeButtons['scrollbar_track'] = { x: LEFT_PANEL_W, y: scrollbarTrackY, w: scrollbarTrackW, h: SCROLLBAR_H };
   }
 
-  // --- TOP BAR ---
   const topGrad = ctx.createLinearGradient(0, 0, 0, TOP_BAR_H);
   topGrad.addColorStop(0, '#1a1c22');
   topGrad.addColorStop(1, '#101216');
@@ -715,7 +720,6 @@ function render() {
   drawSquareButton('stop', 100, 15, 70, 40, "■ STOP", false, "");
   drawSquareButton('rec', 180, 15, 80, 40, "● REC", isRecording, "#ff0033");
   
-  // BPM Area
   drawSquareButton('bpm_down', 280, 15, 30, 40, "<", false, "");
   ctx.fillStyle = '#050505';
   drawRect(315, 15, 70, 40, 4);
@@ -727,7 +731,6 @@ function render() {
 
   drawSquareButton('snap', 435, 15, 80, 40, isSnapEnabled ? "SNAP ON" : "SNAP OFF", isSnapEnabled, "#00aaff");
 
-  // LATENCY COMPENSATION AREA
   drawSquareButton('lat_down', 530, 15, 30, 40, "<", false, "");
   ctx.fillStyle = '#050505';
   drawRect(565, 15, 80, 40, 4);
@@ -756,12 +759,11 @@ function findClipById(id) {
   return null;
 }
 
-// --- INTERACTION PHYSICS ---
-
 window.addEventListener('mousedown', (e) => {
   window.mouseIsDown = true;
   mouseX = e.clientX;
   mouseY = e.clientY;
+  needsRender = true;
 
   let clickedButton = false;
 
@@ -785,7 +787,6 @@ window.addEventListener('mousedown', (e) => {
       if (id === 'bpm_down') { currentBPM = Math.max(40, currentBPM - 1); }
       if (id === 'bpm_up') { currentBPM = Math.min(300, currentBPM + 1); }
       
-      // LATENCY CONTROLS
       if (id === 'lat_down') { globalLatencyMs = Math.max(0, globalLatencyMs - 10); }
       if (id === 'lat_up') { globalLatencyMs = Math.min(1000, globalLatencyMs + 10); }
       
@@ -892,11 +893,13 @@ function updateSlider(mx, box) {
     track.reverb = pct; 
     if (track.wetGainNode) track.wetGainNode.gain.value = track.reverb;
   }
+  needsRender = true;
 }
 
 window.addEventListener('mousemove', (e) => {
   mouseX = e.clientX;
   mouseY = e.clientY;
+  needsRender = true;
   
   if (isDraggingSlider) {
     const box = activeButtons[`${activeSliderType}_${isDraggingSlider}`];
@@ -944,10 +947,12 @@ window.addEventListener('mouseup', () => {
   isDraggingScrollbar = false;
   isDraggingTrim = null;
   isDraggingClip = null; 
+  needsRender = true;
 });
 
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault(); 
+  needsRender = true;
   if (mouseX > LEFT_PANEL_W && mouseY > TOP_BAR_H) {
     
     if (e.ctrlKey || e.shiftKey) {

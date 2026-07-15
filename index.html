@@ -25,8 +25,8 @@
 
 <script>
 /**
- * PURE CANVAS 4-TRACK ENGINE v9.2
- * Added Cross-Track Clip Dragging
+ * PURE CANVAS 4-TRACK ENGINE v9.4
+ * Added: Containerized Header Panels, Rubber UI Overhaul, Right-Anchored Master Meter
  */
 
 const canvas = document.getElementById('app');
@@ -38,6 +38,8 @@ let audioCtx;
 let isPlaying = false;
 let isRecording = false;
 let isMixing = false; 
+let isSaving = false;
+let isLoading = false;
 let playheadTime = 0;
 let lastDrawTime = 0;
 let animationFrameId;
@@ -47,7 +49,7 @@ let isGridEnabled = true;
 
 let isLoopEnabled = false;
 let loopStart = 0;
-let loopEnd = 4; // Defaults to 4 seconds, adjust via dragging
+let loopEnd = 4;
 
 let needsRender = true;
 let globalLatencyMs = 150; 
@@ -61,29 +63,50 @@ let mediaRecorder;
 let audioChunks = [];
 let audioStream;
 let currentRecordStartTime = 0;
+
+// Nodes
 let analyserNode;
 let liveDataArray;
+let masterGainNode;
+let masterAnalyserNode;
+let masterDataArray;
+let masterVuLevel = 0;
 let globalReverbIR = null; 
 
 let selectedClip = null; 
 let clipboardClip = null; 
 
+// UI states
+let activeLoadTrackId = null;
+let activeColorTrackId = null;
+
+// Dragging physics
+let mouseX = 0, mouseY = 0;
+let activeButtons = {}; 
+let isDraggingSlider = null, activeSliderType = null; 
+let isDraggingScrollbar = false, scrollDragOffsetX = 0;
+let isDraggingTrim = null, isDraggingClip = null, clipDragOffsetTime = 0; 
+let isDraggingLoopStart = false, isDraggingLoopEnd = false;
+
+// Timers for BPM hold
+let bpmHoldTimeout = null;
+let bpmHoldInterval = null;
+
 const fileInput = document.createElement('input');
 fileInput.type = 'file';
 fileInput.accept = 'audio/*';
-let activeLoadTrackId = null;
+
+const sessionInput = document.createElement('input');
+sessionInput.type = 'file';
+sessionInput.accept = '.json';
 
 const colorPicker = document.createElement('input');
 colorPicker.type = 'color';
-let activeColorTrackId = null;
 
 colorPicker.addEventListener('input', (e) => {
   if (activeColorTrackId) {
     const track = tracks.find(t => t.id === activeColorTrackId);
-    if (track) {
-        track.color = e.target.value;
-        needsRender = true;
-    }
+    if (track) { track.color = e.target.value; needsRender = true; }
   }
 });
 
@@ -94,24 +117,11 @@ const tracks = [
   { id: 4, color: '#ffcc00', clips: [], gainNode: null, reverbNode: null, wetGainNode: null, armed: false, volume: 1, reverb: 0, livePixels: [] }
 ];
 
-const TOP_BAR_H = 70;
+const TOP_BAR_H = 80; // Increased to accommodate component panels
 const LEFT_PANEL_W = 200; 
 const TIMELINE_H = 40;
 const TRACK_H = 140; 
 const SCROLLBAR_H = 15;
-
-let mouseX = 0;
-let mouseY = 0;
-let activeButtons = {}; 
-let isDraggingSlider = null; 
-let activeSliderType = null; 
-let isDraggingScrollbar = false;
-let scrollDragOffsetX = 0;
-let isDraggingTrim = null; 
-let isDraggingClip = null; 
-let clipDragOffsetTime = 0; 
-let isDraggingLoopStart = false;
-let isDraggingLoopEnd = false;
 
 function resize() {
   width = window.innerWidth;
@@ -144,11 +154,20 @@ function initAudioContext() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     globalReverbIR = generateReverbIR(3.0, 3.5); 
+    
+    // Master Bus Setup
+    masterGainNode = audioCtx.createGain();
+    masterAnalyserNode = audioCtx.createAnalyser();
+    masterAnalyserNode.fftSize = 256;
+    masterDataArray = new Uint8Array(masterAnalyserNode.frequencyBinCount);
+    
+    masterGainNode.connect(masterAnalyserNode);
+    masterAnalyserNode.connect(audioCtx.destination);
 
     tracks.forEach(track => {
       track.gainNode = audioCtx.createGain();
       track.gainNode.gain.value = track.volume;
-      track.gainNode.connect(audioCtx.destination);
+      track.gainNode.connect(masterGainNode);
 
       track.reverbNode = audioCtx.createConvolver();
       track.reverbNode.buffer = globalReverbIR;
@@ -157,7 +176,7 @@ function initAudioContext() {
       track.wetGainNode.gain.value = track.reverb; 
       
       track.reverbNode.connect(track.wetGainNode);
-      track.wetGainNode.connect(audioCtx.destination);
+      track.wetGainNode.connect(masterGainNode);
     });
   }
 }
@@ -174,41 +193,131 @@ function audioBufferToWav(buffer) {
   const bufferArray = new ArrayBuffer(length);
   const view = new DataView(bufferArray);
   const channels = [];
-  let offset = 0;
-  let pos = 0;
+  let offset = 0, pos = 0;
 
   function setUint16(data) { view.setUint16(pos, data, true); pos += 2; }
   function setUint32(data) { view.setUint32(pos, data, true); pos += 4; }
 
-  setUint32(0x46464952); 
-  setUint32(length - 8);
-  setUint32(0x45564157); 
-  setUint32(0x20746d66); 
-  setUint32(16);         
-  setUint16(1);          
-  setUint16(numOfChan);
-  setUint32(buffer.sampleRate);
-  setUint32(buffer.sampleRate * 2 * numOfChan); 
-  setUint16(numOfChan * 2); 
-  setUint16(16);         
-  setUint32(0x61746164); 
-  setUint32(length - pos - 4);
+  setUint32(0x46464952); setUint32(length - 8); setUint32(0x45564157); 
+  setUint32(0x20746d66); setUint32(16); setUint16(1); setUint16(numOfChan);
+  setUint32(buffer.sampleRate); setUint32(buffer.sampleRate * 2 * numOfChan); 
+  setUint16(numOfChan * 2); setUint16(16); setUint32(0x61746164); setUint32(length - pos - 4);
 
-  for (let i = 0; i < buffer.numberOfChannels; i++) {
-    channels.push(buffer.getChannelData(i));
-  }
+  for (let i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
 
   while (pos < length) {
     for (let i = 0; i < numOfChan; i++) {
       let sample = Math.max(-1, Math.min(1, channels[i][offset])); 
       sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; 
-      view.setInt16(pos, sample, true);
-      pos += 2;
+      view.setInt16(pos, sample, true); pos += 2;
     }
     offset++;
   }
   return new Blob([bufferArray], { type: "audio/wav" });
 }
+
+function blobToBase64(blob) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function base64ToArrayBuffer(base64) {
+  const res = await fetch(base64);
+  return await res.arrayBuffer();
+}
+
+async function saveSession() {
+  if (isSaving) return;
+  isSaving = true;
+  needsRender = true;
+  
+  const project = {
+    bpm: currentBPM,
+    latency: globalLatencyMs,
+    tracks: []
+  };
+
+  for (const t of tracks) {
+    const trackData = { id: t.id, color: t.color, armed: t.armed, volume: t.volume, reverb: t.reverb, clips: [] };
+    for (const c of t.clips) {
+      if (!c.buffer) continue;
+      const wavBlob = audioBufferToWav(c.buffer);
+      const base64 = await blobToBase64(wavBlob);
+      trackData.clips.push({
+        id: c.id,
+        startTime: c.startTime,
+        trimDuration: c.trimDuration,
+        audioData: base64
+      });
+    }
+    project.tracks.push(trackData);
+  }
+
+  const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(project));
+  const a = document.createElement('a');
+  a.setAttribute("href", dataStr);
+  a.setAttribute("download", `project_${currentBPM}bpm.json`);
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  
+  isSaving = false;
+  needsRender = true;
+}
+
+sessionInput.onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  isLoading = true;
+  needsRender = true;
+  
+  initAudioContext();
+  stopAudio();
+  
+  try {
+    const text = await file.text();
+    const project = JSON.parse(text);
+    
+    currentBPM = project.bpm || 120;
+    globalLatencyMs = project.latency || 150;
+    
+    for (const pTrack of project.tracks) {
+      const t = tracks.find(trk => trk.id === pTrack.id);
+      if (t) {
+        t.color = pTrack.color;
+        t.armed = pTrack.armed;
+        t.volume = pTrack.volume;
+        t.reverb = pTrack.reverb;
+        t.clips = [];
+        
+        if (t.gainNode) t.gainNode.gain.value = t.volume;
+        if (t.wetGainNode) t.wetGainNode.gain.value = t.reverb;
+        
+        for (const pClip of pTrack.clips) {
+          const arrayBuffer = await base64ToArrayBuffer(pClip.audioData);
+          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+          t.clips.push({
+            id: pClip.id,
+            trackId: t.id,
+            buffer: audioBuffer,
+            startTime: pClip.startTime,
+            trimDuration: pClip.trimDuration,
+            sourceNode: null
+          });
+        }
+      }
+    }
+  } catch (err) {
+    alert("Error loading session file.");
+  }
+  
+  e.target.value = '';
+  isLoading = false;
+  needsRender = true;
+};
 
 async function exportMixdown() {
   if (isMixing) return;
@@ -222,10 +331,7 @@ async function exportMixdown() {
     });
   });
 
-  if (maxEndTime === 0) {
-    alert("Project is empty. Nothing to mix down.");
-    return;
-  }
+  if (maxEndTime === 0) return alert("Project is empty. Nothing to mix down.");
 
   const renderDuration = maxEndTime + 4.0; 
   const sampleRate = audioCtx.sampleRate;
@@ -254,10 +360,8 @@ async function exportMixdown() {
       if (!clip.buffer) return;
       const src = offlineCtx.createBufferSource();
       src.buffer = clip.buffer;
-      
       src.connect(tGain);
       src.connect(tReverb);
-      
       src.start(clip.startTime, 0, clip.trimDuration);
     });
   });
@@ -265,7 +369,6 @@ async function exportMixdown() {
   try {
     const renderedBuffer = await offlineCtx.startRendering();
     const wavBlob = audioBufferToWav(renderedBuffer);
-    
     const url = URL.createObjectURL(wavBlob);
     const a = document.createElement('a');
     a.href = url;
@@ -274,9 +377,7 @@ async function exportMixdown() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  } catch (err) {
-    alert("Mixdown failed.");
-  }
+  } catch (err) { alert("Mixdown failed."); }
 
   isMixing = false;
   needsRender = true;
@@ -284,22 +385,14 @@ async function exportMixdown() {
 
 window.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey) {
-    if (e.key === 'c' || e.key === 'C') {
-      if (selectedClip) clipboardClip = { ...selectedClip }; 
-    }
+    if (e.key === 'c' || e.key === 'C') { if (selectedClip) clipboardClip = { ...selectedClip }; }
     if (e.key === 'v' || e.key === 'V') {
       if (clipboardClip) {
         const track = tracks.find(t => t.id === clipboardClip.trackId);
         if (track) {
-          const newClip = { 
-            ...clipboardClip, 
-            id: generateUUID(), 
-            startTime: clipboardClip.startTime + clipboardClip.trimDuration 
-          };
+          const newClip = { ...clipboardClip, id: generateUUID(), startTime: clipboardClip.startTime + clipboardClip.trimDuration };
           track.clips.push(newClip);
-          selectedClip = newClip; 
-          clipboardClip = newClip; 
-          needsRender = true;
+          selectedClip = newClip; clipboardClip = newClip; needsRender = true;
         }
       }
     }
@@ -312,24 +405,13 @@ fileInput.onchange = async (e) => {
   initAudioContext();
   const arrayBuffer = await file.arrayBuffer();
   const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  
   const track = tracks.find(t => t.id === activeLoadTrackId);
-  
   const newClip = {
-    id: generateUUID(),
-    trackId: track.id,
-    buffer: audioBuffer,
-    startTime: getSnappedTime(playheadTime),
-    trimDuration: audioBuffer.duration,
-    sourceNode: null
+    id: generateUUID(), trackId: track.id, buffer: audioBuffer,
+    startTime: getSnappedTime(playheadTime), trimDuration: audioBuffer.duration, sourceNode: null
   };
-  
   track.clips.push(newClip);
-  selectedClip = newClip;
-  
-  e.target.value = '';
-  activeLoadTrackId = null;
-  needsRender = true;
+  selectedClip = newClip; e.target.value = ''; activeLoadTrackId = null; needsRender = true;
 };
 
 function scheduleClips() {
@@ -337,7 +419,6 @@ function scheduleClips() {
     track.clips.forEach(clip => {
       clip.sourceNode = audioCtx.createBufferSource();
       clip.sourceNode.buffer = clip.buffer;
-      
       clip.sourceNode.connect(track.gainNode);
       clip.sourceNode.connect(track.reverbNode);
 
@@ -365,9 +446,7 @@ function stopAudio() {
   isRecording = false;
   needsRender = true;
   
-  if (mediaRecorder && mediaRecorder.state === "recording") {
-    mediaRecorder.stop();
-  }
+  if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
   tracks.forEach(track => {
     track.clips.forEach(clip => {
       if (clip.sourceNode) {
@@ -398,7 +477,6 @@ async function recordAudio() {
 
   mediaRecorder = new MediaRecorder(audioStream);
   audioChunks = [];
-  
   currentRecordStartTime = getSnappedTime(playheadTime);
   armedTrack.livePixels = [];
   
@@ -412,96 +490,120 @@ async function recordAudio() {
     const compensatedStartTime = Math.max(0, currentRecordStartTime - latencyOffsetSeconds);
 
     const newClip = {
-      id: generateUUID(),
-      trackId: armedTrack.id,
-      buffer: audioBuffer,
-      startTime: compensatedStartTime,
-      trimDuration: audioBuffer.duration,
-      sourceNode: null
+      id: generateUUID(), trackId: armedTrack.id, buffer: audioBuffer,
+      startTime: compensatedStartTime, trimDuration: audioBuffer.duration, sourceNode: null
     };
     armedTrack.clips.push(newClip);
-    selectedClip = newClip;
-    armedTrack.livePixels = [];
-    needsRender = true;
+    selectedClip = newClip; armedTrack.livePixels = []; needsRender = true;
   };
 
-  isRecording = true;
-  needsRender = true;
-  playAudio();
-  mediaRecorder.start();
+  isRecording = true; needsRender = true; playAudio(); mediaRecorder.start();
 }
 
 function drawRect(x, y, w, h, radius, fill) {
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, radius);
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, radius);
   if (fill) { ctx.fillStyle = fill; ctx.fill(); }
 }
 
+function drawPanelBacking(x, y, w, h) {
+  ctx.fillStyle = '#0f1115';
+  drawRect(x, y, w, h, 8, '#0f1115');
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = '#222';
+  ctx.strokeRect(x, y, w, h);
+}
+
+// Overhauled Rubber Button Physics
 function drawSquareButton(id, x, y, w, h, text, isActive, colorStr) {
   activeButtons[id] = { x, y, w, h };
   const isHover = mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + h;
-  const isPressed = isHover && (window.mouseIsDown) || isActive;
-  
-  const baseColor = isActive ? colorStr : '#1e2126';
-  
-  ctx.save();
-  if (isPressed && !isActive) ctx.translate(0, 2);
+  const isPressed = (isHover && window.mouseIsDown) || isActive;
 
-  drawRect(x, y, w, h, 4, baseColor);
+  const baseColor = isActive ? colorStr : (isHover ? '#2e323b' : '#25282e');
+  const radius = 6;
+
+  ctx.save();
   
-  if (!isPressed && !isActive) {
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
-    drawRect(x, y, w, h/2, 4);
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-    drawRect(x, y + h/2, w, h/2, 4);
-  } else {
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
-    drawRect(x, y, w, h, 4);
+  // Drop shadow for idle (unpressed) rubber state
+  if (!isPressed) {
+    ctx.shadowColor = 'rgba(0,0,0,0.8)';
+    ctx.shadowBlur = 4;
+    ctx.shadowOffsetY = 2;
   }
-  
+
+  // Base shape
+  ctx.beginPath();
+  ctx.roundRect(x, y + (isPressed ? 2 : 0), w, h, radius);
+  ctx.fillStyle = baseColor;
+  ctx.fill();
+  ctx.shadowColor = 'transparent'; // clear shadow for inner layers
+
+  // Matte soft highlight
+  if (!isPressed && !isActive) {
+    const topGrad = ctx.createLinearGradient(x, y, x, y + h/2);
+    topGrad.addColorStop(0, 'rgba(255,255,255,0.08)');
+    topGrad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = topGrad;
+    ctx.fill();
+  }
+
+  // Deep inset shadow for pressed state
+  if (isPressed) {
+    const insetGrad = ctx.createLinearGradient(x, y + 2, x, y + h + 2);
+    insetGrad.addColorStop(0, 'rgba(0,0,0,0.5)');
+    insetGrad.addColorStop(0.3, 'rgba(0,0,0,0.1)');
+    insetGrad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = insetGrad;
+    ctx.fill();
+  }
+
+  // Soft border line
   ctx.lineWidth = 1;
-  ctx.strokeStyle = isPressed || isActive ? '#000' : '#333';
-  ctx.strokeRect(x, y, w, h);
-  
-  ctx.fillStyle = isActive ? '#fff' : '#ccc';
-  ctx.font = 'bold 12px monospace';
+  ctx.strokeStyle = isPressed ? '#080808' : '#111';
+  ctx.stroke();
+
+  // Typography
+  ctx.fillStyle = isActive ? '#fff' : (isHover ? '#fff' : '#aaa');
+  ctx.font = 'bold 11px monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(text, x + w / 2, y + h / 2);
+  ctx.fillText(text, x + w / 2, y + h / 2 + (isPressed ? 2 : 0));
+
   ctx.restore();
 }
 
 function drawMacroFader(id, x, y, w, h, value, color, label) {
   activeButtons[id] = { x, y: y - 10, w, h: h + 20 };
   
-  ctx.fillStyle = '#0a0b0d';
-  drawRect(x, y, w, h, 2, '#0a0b0d');
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = '#222';
-  ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = '#0a0b0d'; drawRect(x, y, w, h, 2, '#0a0b0d');
+  ctx.lineWidth = 1; ctx.strokeStyle = '#222'; ctx.strokeRect(x, y, w, h);
 
   const fillW = value * w;
-  ctx.fillStyle = color;
-  ctx.shadowBlur = 8;
-  ctx.shadowColor = color;
-  drawRect(x, y, fillW, h, 2, color);
-  ctx.shadowBlur = 0;
+  ctx.fillStyle = color; ctx.shadowBlur = 8; ctx.shadowColor = color;
+  drawRect(x, y, fillW, h, 2, color); ctx.shadowBlur = 0;
 
   const thumbX = x + fillW;
-  ctx.fillStyle = '#ddd';
-  drawRect(thumbX - 6, y - 4, 12, h + 8, 2, '#ddd');
-  
-  ctx.fillStyle = '#333';
-  ctx.fillRect(thumbX - 2, y + h/2 - 4, 1, 8);
-  ctx.fillRect(thumbX + 1, y + h/2 - 4, 1, 8);
-
-  ctx.fillStyle = '#888';
-  ctx.font = '10px monospace';
-  ctx.textAlign = 'left';
-  ctx.fillText(label, x, y - 6);
+  ctx.fillStyle = '#ddd'; drawRect(thumbX - 6, y - 4, 12, h + 8, 2, '#ddd');
+  ctx.fillStyle = '#333'; ctx.fillRect(thumbX - 2, y + h/2 - 4, 1, 8); ctx.fillRect(thumbX + 1, y + h/2 - 4, 1, 8);
+  ctx.fillStyle = '#888'; ctx.font = '10px monospace'; ctx.textAlign = 'left'; ctx.fillText(label, x, y - 6);
 }
 
 function render() {
+  // Update Master VU level smoothly
+  if ((isPlaying || isRecording) && masterAnalyserNode) {
+    masterAnalyserNode.getByteTimeDomainData(masterDataArray);
+    let max = 0;
+    for(let i=0; i<masterDataArray.length; i++) {
+       const val = Math.abs(masterDataArray[i] - 128) / 128;
+       if (val > max) max = val;
+    }
+    masterVuLevel = max;
+  } else {
+    masterVuLevel *= 0.85; // smooth decay
+  }
+
+  if (masterVuLevel > 0.01) needsRender = true;
+
   if (!isPlaying && !isRecording && !needsRender) {
     requestAnimationFrame(render);
     return;
@@ -509,10 +611,8 @@ function render() {
   needsRender = false;
 
   const chassisGrad = ctx.createLinearGradient(0, 0, 0, height);
-  chassisGrad.addColorStop(0, '#121418');
-  chassisGrad.addColorStop(1, '#08090a');
-  ctx.fillStyle = chassisGrad;
-  ctx.fillRect(0, 0, width, height);
+  chassisGrad.addColorStop(0, '#121418'); chassisGrad.addColorStop(1, '#08090a');
+  ctx.fillStyle = chassisGrad; ctx.fillRect(0, 0, width, height);
   activeButtons = {}; 
 
   if (isPlaying) {
@@ -520,23 +620,14 @@ function render() {
     playheadTime += (now - lastDrawTime);
     lastDrawTime = now;
     
-    // LOOP TICK LOGIC
     if (isLoopEnabled && playheadTime >= loopEnd) {
        playheadTime = loopStart;
-       // Stop all current playing nodes to re-sync
-       tracks.forEach(track => {
-         track.clips.forEach(clip => {
-           if (clip.sourceNode) {
-             try { clip.sourceNode.stop(); } catch(e) {}
-             clip.sourceNode.disconnect();
-             clip.sourceNode = null;
-           }
-         });
-       });
+       tracks.forEach(track => { track.clips.forEach(clip => {
+         if (clip.sourceNode) { try { clip.sourceNode.stop(); } catch(e) {} clip.sourceNode.disconnect(); clip.sourceNode = null; }
+       });});
        lastDrawTime = audioCtx.currentTime;
-       scheduleClips(); // Re-trigger nodes
+       scheduleClips();
     }
-
     if (playheadTime > TOTAL_DURATION) { stopAudio(); playheadTime = 0; }
     
     if (isRecording && analyserNode) {
@@ -553,16 +644,14 @@ function render() {
     }
   }
 
+  // DRAW RULER & GRID
   ctx.save();
-  ctx.beginPath();
-  ctx.rect(LEFT_PANEL_W, TOP_BAR_H, width - LEFT_PANEL_W, height - TOP_BAR_H - SCROLLBAR_H);
-  ctx.clip();
+  ctx.beginPath(); ctx.rect(LEFT_PANEL_W, TOP_BAR_H, width - LEFT_PANEL_W, height - TOP_BAR_H - SCROLLBAR_H); ctx.clip();
   ctx.translate(LEFT_PANEL_W - viewOffsetX, TOP_BAR_H);
 
   const secondsPerBeat = 60 / currentBPM;
   const secondsPerBar = secondsPerBeat * 4;
 
-  // BACKGROUND BAR SHADING
   if (isGridEnabled) {
     let barCount = 0;
     for(let t = 0; t <= TOTAL_DURATION; t += secondsPerBar) {
@@ -573,54 +662,35 @@ function render() {
       barCount++;
     }
   } else {
-    ctx.fillStyle = '#08090a';
-    ctx.fillRect(0, 0, TOTAL_DURATION * zoomLevel, height);
+    ctx.fillStyle = '#08090a'; ctx.fillRect(0, 0, TOTAL_DURATION * zoomLevel, height);
   }
 
-  ctx.fillStyle = 'rgba(0,0,0,0.4)';
-  ctx.fillRect(0, 0, TOTAL_DURATION * zoomLevel, TIMELINE_H);
-  ctx.strokeStyle = '#1a1c20';
-  ctx.beginPath(); ctx.moveTo(0, TIMELINE_H); ctx.lineTo(TOTAL_DURATION * zoomLevel, TIMELINE_H); ctx.stroke();
+  ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(0, 0, TOTAL_DURATION * zoomLevel, TIMELINE_H);
+  ctx.strokeStyle = '#1a1c20'; ctx.beginPath(); ctx.moveTo(0, TIMELINE_H); ctx.lineTo(TOTAL_DURATION * zoomLevel, TIMELINE_H); ctx.stroke();
 
   let beatCount = 0;
   for(let t = 0; t <= TOTAL_DURATION; t += secondsPerBeat) {
     const px = t * zoomLevel;
     if (beatCount % 4 === 0) {
       ctx.fillStyle = '#444'; ctx.fillRect(px, TIMELINE_H - 12, 2, 12);
-      ctx.fillStyle = 'rgba(255,255,255,0.02)';
-      ctx.fillRect(px, TIMELINE_H, 1, height);
-    } else {
-      ctx.fillStyle = '#222'; ctx.fillRect(px, TIMELINE_H - 6, 1, 6);
-    }
+      ctx.fillStyle = 'rgba(255,255,255,0.02)'; ctx.fillRect(px, TIMELINE_H, 1, height);
+    } else { ctx.fillStyle = '#222'; ctx.fillRect(px, TIMELINE_H - 6, 1, 6); }
     beatCount++;
   }
 
-  // DRAW LOOP REGION & HANDLES
   if (isLoopEnabled) {
-    const lx = loopStart * zoomLevel;
-    const lw = (loopEnd - loopStart) * zoomLevel;
-    
-    ctx.fillStyle = 'rgba(255, 0, 255, 0.15)';
-    ctx.fillRect(lx, 0, lw, height);
-    
-    ctx.fillStyle = '#ff00ff';
-    ctx.fillRect(lx, 0, 2, height);
-    ctx.fillRect(lx + lw - 2, 0, 2, height);
-
+    const lx = loopStart * zoomLevel; const lw = (loopEnd - loopStart) * zoomLevel;
+    ctx.fillStyle = 'rgba(255, 0, 255, 0.15)'; ctx.fillRect(lx, 0, lw, height);
+    ctx.fillStyle = '#ff00ff'; ctx.fillRect(lx, 0, 2, height); ctx.fillRect(lx + lw - 2, 0, 2, height);
     activeButtons['loop_start'] = { x: lx - 8, y: 0, w: 16, h: TIMELINE_H, isWorld: true };
     activeButtons['loop_end'] = { x: lx + lw - 8, y: 0, w: 16, h: TIMELINE_H, isWorld: true };
-
-    ctx.beginPath();
-    ctx.moveTo(lx, 5); ctx.lineTo(lx + 10, 5); ctx.lineTo(lx, 15); ctx.fill();
-    ctx.beginPath();
-    ctx.moveTo(lx + lw, 5); ctx.lineTo(lx + lw - 10, 5); ctx.lineTo(lx + lw, 15); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(lx, 5); ctx.lineTo(lx + 10, 5); ctx.lineTo(lx, 15); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(lx + lw, 5); ctx.lineTo(lx + lw - 10, 5); ctx.lineTo(lx + lw, 15); ctx.fill();
   }
 
   tracks.forEach((track, i) => {
     const trackY = TIMELINE_H + (i * (TRACK_H + 10));
-    
-    ctx.strokeStyle = '#15171a';
-    ctx.strokeRect(0, trackY, TOTAL_DURATION * zoomLevel, TRACK_H);
+    ctx.strokeStyle = '#15171a'; ctx.strokeRect(0, trackY, TOTAL_DURATION * zoomLevel, TRACK_H);
     
     track.clips.forEach(clip => {
       const startPixel = clip.startTime * zoomLevel;
@@ -628,13 +698,10 @@ function render() {
       const waveYCenter = trackY + amp;
 
       ctx.save();
-      ctx.shadowBlur = 10;
-      ctx.shadowColor = track.color; 
-      ctx.fillStyle = track.color;
+      ctx.shadowBlur = 10; ctx.shadowColor = track.color; ctx.fillStyle = track.color;
 
       const fullWaveWidthPixels = clip.buffer.duration * zoomLevel;
       const visibleWaveWidthPixels = clip.trimDuration * zoomLevel;
-      
       const data = clip.buffer.getChannelData(0);
       const step = Math.max(1, Math.ceil(data.length / fullWaveWidthPixels));
 
@@ -653,57 +720,39 @@ function render() {
       }
 
       ctx.shadowBlur = 0; 
-      
       if (selectedClip && selectedClip.id === clip.id) {
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(startPixel, trackY, visibleWaveWidthPixels, TRACK_H);
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(startPixel, trackY, visibleWaveWidthPixels, TRACK_H);
       }
       
       activeButtons[`del_${clip.id}`] = { x: startPixel, y: trackY, w: 20, h: 20, isWorld: true };
-      ctx.fillStyle = '#cc0000';
-      ctx.fillRect(startPixel, trackY, 20, 20);
-      ctx.fillStyle = '#fff';
-      ctx.font = '10px sans-serif';
-      ctx.fillText('✕', startPixel + 10, trackY + 10);
+      ctx.fillStyle = '#cc0000'; ctx.fillRect(startPixel, trackY, 20, 20);
+      ctx.fillStyle = '#fff'; ctx.font = '10px sans-serif'; ctx.fillText('✕', startPixel + 10, trackY + 10);
       
       const dragHandleW = visibleWaveWidthPixels - 20;
       if (dragHandleW > 10) {
         const handleX = startPixel + 20;
         activeButtons[`move_${clip.id}`] = { x: handleX, y: trackY, w: dragHandleW, h: 20, isWorld: true };
-        
         ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
         if (isDraggingClip && isDraggingClip.id === clip.id) ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
         else if (selectedClip && selectedClip.id === clip.id) ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
-        
         ctx.fillRect(handleX, trackY, dragHandleW, 20);
-        
-        ctx.fillStyle = '#aaa';
-        ctx.font = '10px monospace';
-        ctx.fillText('⣿⣿ DRAG', handleX + dragHandleW / 2, trackY + 10);
+        ctx.fillStyle = '#aaa'; ctx.font = '10px monospace'; ctx.fillText('⣿⣿ DRAG', handleX + dragHandleW / 2, trackY + 10);
       }
 
       const trimHandleX = startPixel + visibleWaveWidthPixels - 10;
       activeButtons[`trim_${clip.id}`] = { x: trimHandleX, y: trackY, w: 14, h: TRACK_H, isWorld: true };
-      
       ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
       if (isDraggingTrim === clip.id) ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
       ctx.fillRect(trimHandleX, trackY, 14, TRACK_H);
-      
       ctx.fillStyle = '#fff';
-      ctx.fillRect(trimHandleX + 4, trackY + TRACK_H/2 - 10, 2, 20); 
-      ctx.fillRect(trimHandleX + 8, trackY + TRACK_H/2 - 10, 2, 20);
-
+      ctx.fillRect(trimHandleX + 4, trackY + TRACK_H/2 - 10, 2, 20); ctx.fillRect(trimHandleX + 8, trackY + TRACK_H/2 - 10, 2, 20);
       ctx.restore();
     });
 
     if (track.livePixels.length > 0) {
       ctx.save();
-      ctx.shadowBlur = 12;
-      ctx.shadowColor = '#ff2a2a';
-      ctx.fillStyle = '#ff2a2a';
-      const amp = TRACK_H / 2;
-      const waveYCenter = trackY + amp;
+      ctx.shadowBlur = 12; ctx.shadowColor = '#ff2a2a'; ctx.fillStyle = '#ff2a2a';
+      const waveYCenter = trackY + (TRACK_H / 2);
       track.livePixels.forEach(p => {
          const px = p.time * zoomLevel;
          const h = Math.max(2, p.val * TRACK_H);
@@ -714,100 +763,115 @@ function render() {
   });
 
   const playheadX = playheadTime * zoomLevel;
-  ctx.fillStyle = '#fff';
-  ctx.shadowBlur = 10;
-  ctx.shadowColor = '#fff';
-  ctx.fillRect(playheadX, 0, 2, height);
-  ctx.shadowBlur = 0;
-  ctx.restore(); 
+  ctx.fillStyle = '#fff'; ctx.shadowBlur = 10; ctx.shadowColor = '#fff';
+  ctx.fillRect(playheadX, 0, 2, height); ctx.shadowBlur = 0; ctx.restore(); 
 
-  ctx.fillStyle = '#101216';
-  ctx.fillRect(0, TOP_BAR_H, LEFT_PANEL_W, height - TOP_BAR_H);
-  ctx.strokeStyle = '#000';
-  ctx.lineWidth = 2;
+  // LEFT PANEL MIXER
+  ctx.fillStyle = '#101216'; ctx.fillRect(0, TOP_BAR_H, LEFT_PANEL_W, height - TOP_BAR_H);
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(LEFT_PANEL_W, TOP_BAR_H); ctx.lineTo(LEFT_PANEL_W, height); ctx.stroke();
 
   tracks.forEach((track, i) => {
     const trackY = TOP_BAR_H + TIMELINE_H + (i * (TRACK_H + 10));
-    
-    ctx.fillStyle = '#0d0f12';
-    drawRect(10, trackY + 5, LEFT_PANEL_W - 20, TRACK_H - 10, 6);
-    
-    ctx.fillStyle = '#888';
-    ctx.font = 'bold 12px monospace';
-    ctx.textAlign = 'left';
-    ctx.fillText(`CH ${track.id}`, 20, trackY + 25);
+    ctx.fillStyle = '#0d0f12'; drawRect(10, trackY + 5, LEFT_PANEL_W - 20, TRACK_H - 10, 6);
+    ctx.fillStyle = '#888'; ctx.font = 'bold 12px monospace'; ctx.textAlign = 'left'; ctx.fillText(`CH ${track.id}`, 20, trackY + 25);
 
-    const colorBoxX = LEFT_PANEL_W - 35;
-    const colorBoxY = trackY + 15;
+    const colorBoxX = LEFT_PANEL_W - 35, colorBoxY = trackY + 15;
     drawRect(colorBoxX, colorBoxY, 15, 15, 3, track.color, '#333');
     activeButtons[`color_${track.id}`] = { x: colorBoxX, y: colorBoxY, w: 15, h: 15 };
 
     drawSquareButton(`arm_${track.id}`, 20, trackY + 35, 60, 25, "ARM", track.armed, "#ff0033");
     drawSquareButton(`load_${track.id}`, 90, trackY + 35, 60, 25, "LOAD", false, "");
-
     drawMacroFader(`vol_${track.id}`, 20, trackY + 85, 140, 14, track.volume / 2, '#00ffff', 'LEVEL');
     drawMacroFader(`rev_${track.id}`, 20, trackY + 115, 140, 14, track.reverb, '#ff00ff', 'REVERB');
   });
 
-  const scrollbarTrackW = width - LEFT_PANEL_W;
-  const scrollbarTrackY = height - SCROLLBAR_H;
-  ctx.fillStyle = '#08090a';
-  ctx.fillRect(LEFT_PANEL_W, scrollbarTrackY, scrollbarTrackW, SCROLLBAR_H);
+  // SCROLLBAR
+  const scrollbarTrackW = width - LEFT_PANEL_W, scrollbarTrackY = height - SCROLLBAR_H;
+  ctx.fillStyle = '#08090a'; ctx.fillRect(LEFT_PANEL_W, scrollbarTrackY, scrollbarTrackW, SCROLLBAR_H);
 
-  const totalWorldW = TOTAL_DURATION * zoomLevel;
-  const visibleWorldW = width - LEFT_PANEL_W;
-  
+  const totalWorldW = TOTAL_DURATION * zoomLevel, visibleWorldW = width - LEFT_PANEL_W;
   if (totalWorldW > visibleWorldW) {
     const thumbW = Math.max(30, (visibleWorldW / totalWorldW) * scrollbarTrackW);
     const thumbX = LEFT_PANEL_W + (viewOffsetX / (totalWorldW - visibleWorldW)) * (scrollbarTrackW - thumbW);
-    
     drawRect(thumbX, scrollbarTrackY + 2, thumbW, SCROLLBAR_H - 4, 5, isDraggingScrollbar ? '#555' : '#2a2d33');
     activeButtons['scrollbar_thumb'] = { x: thumbX, y: scrollbarTrackY, w: thumbW, h: SCROLLBAR_H };
     activeButtons['scrollbar_track'] = { x: LEFT_PANEL_W, y: scrollbarTrackY, w: scrollbarTrackW, h: SCROLLBAR_H };
   }
 
+  // ----------------------------------------------------
+  // OVERHAULED COMPONENT PANEL HEADER
+  // ----------------------------------------------------
   const topGrad = ctx.createLinearGradient(0, 0, 0, TOP_BAR_H);
-  topGrad.addColorStop(0, '#1a1c22');
-  topGrad.addColorStop(1, '#101216');
-  ctx.fillStyle = topGrad;
-  ctx.fillRect(0, 0, width, TOP_BAR_H);
-  ctx.strokeStyle = '#000';
-  ctx.beginPath(); ctx.moveTo(0, TOP_BAR_H); ctx.lineTo(width, TOP_BAR_H); ctx.stroke();
+  topGrad.addColorStop(0, '#1c1e24'); topGrad.addColorStop(1, '#121418');
+  ctx.fillStyle = topGrad; ctx.fillRect(0, 0, width, TOP_BAR_H);
+  ctx.strokeStyle = '#000'; ctx.beginPath(); ctx.moveTo(0, TOP_BAR_H); ctx.lineTo(width, TOP_BAR_H); ctx.stroke();
 
-  drawSquareButton('play', 20, 15, 70, 40, "▶ PLAY", isPlaying, "#00ff66");
-  drawSquareButton('stop', 100, 15, 70, 40, "■ STOP", false, "");
-  drawSquareButton('rec', 180, 15, 80, 40, "● REC", isRecording, "#ff0033");
+  // PANEL 1: TRANSPORT
+  drawPanelBacking(10, 10, 200, 60);
+  drawSquareButton('play', 20, 20, 50, 40, "▶", isPlaying, "#00ff66");
+  drawSquareButton('stop', 80, 20, 50, 40, "■", false, "");
+  drawSquareButton('rec', 140, 20, 60, 40, "● REC", isRecording, "#ff0033");
   
-  drawSquareButton('bpm_down', 275, 15, 30, 40, "<", false, "");
-  ctx.fillStyle = '#050505';
-  drawRect(310, 15, 70, 40, 4);
-  ctx.fillStyle = '#00e5ff';
-  ctx.font = '14px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(`${currentBPM} BPM`, 345, 35);
-  drawSquareButton('bpm_up', 385, 15, 30, 40, ">", false, "");
+  // PANEL 2: TIMING
+  drawPanelBacking(220, 10, 260, 60);
+  drawSquareButton('bpm_down', 230, 20, 30, 40, "<", false, "");
+  ctx.fillStyle = '#050505'; drawRect(265, 20, 70, 40, 4);
+  ctx.fillStyle = '#00e5ff'; ctx.font = '14px monospace'; ctx.textAlign = 'center'; ctx.fillText(`${currentBPM} BPM`, 300, 40);
+  drawSquareButton('bpm_up', 340, 20, 30, 40, ">", false, "");
+  drawSquareButton('snap', 380, 20, 40, 40, isSnapEnabled ? "SNAP" : "FREE", isSnapEnabled, "#00aaff");
+  drawSquareButton('grid', 430, 20, 40, 40, isGridEnabled ? "GRID" : "OFF", isGridEnabled, "#00aaff");
 
-  drawSquareButton('snap', 430, 15, 80, 40, isSnapEnabled ? "SNAP ON" : "SNAP OFF", isSnapEnabled, "#00aaff");
-  drawSquareButton('grid', 520, 15, 80, 40, isGridEnabled ? "GRID ON" : "GRID OFF", isGridEnabled, "#00aaff");
+  // PANEL 3: SETTINGS & TOOLS
+  drawPanelBacking(490, 10, 390, 60);
+  drawSquareButton('lat_down', 500, 20, 30, 40, "<", false, "");
+  ctx.fillStyle = '#050505'; drawRect(535, 20, 80, 40, 4);
+  ctx.fillStyle = '#ffcc00'; ctx.font = '11px monospace'; ctx.textAlign = 'center';
+  ctx.fillText(`LATENCY`, 575, 30); ctx.fillText(`${globalLatencyMs}ms`, 575, 45);
+  drawSquareButton('lat_up', 620, 20, 30, 40, ">", false, "");
+  drawSquareButton('loop', 660, 20, 50, 40, "LOOP", isLoopEnabled, "#ff00ff");
+  drawSquareButton('save_sesh', 720, 20, 45, 40, isSaving ? "..." : "SAVE", isSaving, "#00ff66");
+  drawSquareButton('load_sesh', 775, 20, 45, 40, isLoading ? "..." : "LOAD", isLoading, "#00e5ff");
+  drawSquareButton('mixdown', 830, 20, 40, 40, isMixing ? "MIX" : "MIX", isMixing, "#ff9900");
 
-  drawSquareButton('lat_down', 615, 15, 30, 40, "<", false, "");
-  ctx.fillStyle = '#050505';
-  drawRect(650, 15, 80, 40, 4);
-  ctx.fillStyle = '#ffcc00';
-  ctx.font = '11px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(`LATENCY`, 690, 25);
-  ctx.fillText(`${globalLatencyMs}ms`, 690, 40);
-  drawSquareButton('lat_up', 735, 15, 30, 40, ">", false, "");
+  // PANEL 4: MASTER (Anchored Far Right)
+  const masterPanelW = 220;
+  const masterPanelX = width - masterPanelW - 10;
+  
+  if (masterPanelX > 890) { // Prevent overlap on very small screens
+    drawPanelBacking(masterPanelX, 10, masterPanelW, 60);
+    
+    // Time Text Inside Master Panel
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 22px monospace'; ctx.textAlign = 'right';
+    ctx.fillText(playheadTime.toFixed(2) + 's', masterPanelX + 85, 42);
 
-  drawSquareButton('loop', 780, 15, 80, 40, isLoopEnabled ? "LOOP ON" : "LOOP OFF", isLoopEnabled, "#ff00ff");
-  drawSquareButton('mixdown', 875, 15, 90, 40, isMixing ? "MIXING..." : "MIXDOWN", isMixing, "#ff9900");
-
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 24px monospace';
-  ctx.textAlign = 'right';
-  ctx.fillText(playheadTime.toFixed(2) + 's', width - 20, TOP_BAR_H / 2);
+    // Master VU Meter Inside Panel
+    const meterX = masterPanelX + 105;
+    const meterY = 20;
+    const meterW = 100;
+    const meterH = 40;
+    
+    ctx.fillStyle = '#0a0b0d';
+    drawRect(meterX, meterY, meterW, meterH, 4, '#0a0b0d');
+    ctx.strokeStyle = '#222';
+    ctx.strokeRect(meterX, meterY, meterW, meterH);
+    
+    const meterGrad = ctx.createLinearGradient(meterX, 0, meterX + meterW, 0);
+    meterGrad.addColorStop(0, '#00ff66');
+    meterGrad.addColorStop(0.7, '#ffcc00');
+    meterGrad.addColorStop(1, '#ff0033');
+    
+    const currentVuW = meterW * (masterVuLevel * 2); // Boost visually
+    ctx.fillStyle = meterGrad;
+    drawRect(meterX + 2, meterY + 2, Math.min(meterW - 4, currentVuW), meterH - 4, 2, meterGrad);
+    
+    // Meter overlay segments
+    ctx.fillStyle = '#0a0b0d';
+    for(let i=10; i<meterW; i+=10) { ctx.fillRect(meterX + i, meterY, 2, meterH); }
+    
+    ctx.fillStyle = '#888'; ctx.font = '9px monospace'; ctx.textAlign = 'right';
+    ctx.fillText('MST', meterX - 6, 40);
+  }
 
   requestAnimationFrame(render);
 }
@@ -822,19 +886,13 @@ function findClipById(id) {
 
 window.addEventListener('mousedown', (e) => {
   window.mouseIsDown = true;
-  mouseX = e.clientX;
-  mouseY = e.clientY;
+  mouseX = e.clientX; mouseY = e.clientY;
   needsRender = true;
-
   let clickedButton = false;
 
   for (const [id, box] of Object.entries(activeButtons)) {
-    let checkX = mouseX;
-    let checkY = mouseY;
-    if (box.isWorld) {
-      checkX = mouseX - LEFT_PANEL_W + viewOffsetX;
-      checkY = mouseY - TOP_BAR_H;
-    }
+    let checkX = mouseX, checkY = mouseY;
+    if (box.isWorld) { checkX = mouseX - LEFT_PANEL_W + viewOffsetX; checkY = mouseY - TOP_BAR_H; }
 
     if (checkX >= box.x && checkX <= box.x + box.w && checkY >= box.y && checkY <= box.y + box.h) {
       clickedButton = true;
@@ -843,55 +901,47 @@ window.addEventListener('mousedown', (e) => {
       if (id === 'stop') stopAudio();
       if (id === 'rec') recordAudio();
       if (id === 'mixdown') exportMixdown();
-      if (id === 'snap') { isSnapEnabled = !isSnapEnabled; }
-      if (id === 'grid') { isGridEnabled = !isGridEnabled; }
+      if (id === 'save_sesh') saveSession();
+      if (id === 'load_sesh') sessionInput.click();
+      if (id === 'snap') isSnapEnabled = !isSnapEnabled;
+      if (id === 'grid') isGridEnabled = !isGridEnabled;
       if (id === 'loop') { 
         isLoopEnabled = !isLoopEnabled; 
         if (isLoopEnabled && playheadTime > loopEnd) playheadTime = loopStart;
       }
       
-      if (id === 'bpm_down') { 
-        currentBPM = Math.max(40, currentBPM - 1);
-        loopEnd = loopStart + (60 / currentBPM) * 4; 
-      }
-      if (id === 'bpm_up') { 
-        currentBPM = Math.min(300, currentBPM + 1); 
-        loopEnd = loopStart + (60 / currentBPM) * 4;
+      if (id === 'bpm_down' || id === 'bpm_up') { 
+        const step = () => {
+          currentBPM = id === 'bpm_down' ? Math.max(40, currentBPM - 1) : Math.min(300, currentBPM + 1);
+          loopEnd = loopStart + (60 / currentBPM) * 4;
+          needsRender = true;
+        };
+        step();
+        bpmHoldTimeout = setTimeout(() => { bpmHoldInterval = setInterval(step, 50); }, 400);
       }
       
-      if (id === 'lat_down') { globalLatencyMs = Math.max(0, globalLatencyMs - 10); }
-      if (id === 'lat_up') { globalLatencyMs = Math.min(1000, globalLatencyMs + 10); }
-      
-      if (id === 'loop_start') {
-        isDraggingLoopStart = true;
-        return;
-      }
-      if (id === 'loop_end') {
-        isDraggingLoopEnd = true;
-        return;
-      }
+      if (id === 'lat_down') globalLatencyMs = Math.max(0, globalLatencyMs - 10);
+      if (id === 'lat_up') globalLatencyMs = Math.min(1000, globalLatencyMs + 10);
+      if (id === 'loop_start') { isDraggingLoopStart = true; return; }
+      if (id === 'loop_end') { isDraggingLoopEnd = true; return; }
 
       if (id.startsWith('color_')) {
         activeColorTrackId = parseInt(id.split('_')[1]);
         const t = tracks.find(t => t.id === activeColorTrackId);
-        colorPicker.value = t.color; 
-        colorPicker.click();
+        colorPicker.value = t.color; colorPicker.click();
       }
       
       if (id.startsWith('trim_')) {
-        const cId = id.split('_')[1];
-        isDraggingTrim = cId;
+        const cId = id.split('_')[1]; isDraggingTrim = cId;
         const result = findClipById(cId);
         if (result) selectedClip = result.clip;
         return;
       }
       
       if (id.startsWith('move_')) {
-        const cId = id.split('_')[1];
-        const result = findClipById(cId);
+        const cId = id.split('_')[1]; const result = findClipById(cId);
         if (result) {
-          isDraggingClip = result.clip;
-          selectedClip = result.clip; 
+          isDraggingClip = result.clip; selectedClip = result.clip; 
           const worldX = mouseX - LEFT_PANEL_W + viewOffsetX;
           clipDragOffsetTime = (worldX / zoomLevel) - result.clip.startTime;
         }
@@ -902,61 +952,35 @@ window.addEventListener('mousedown', (e) => {
         const tId = parseInt(id.split('_')[1]);
         tracks.forEach(t => t.armed = (t.id === tId) ? !t.armed : false);
       }
-      if (id.startsWith('load_')) {
-        activeLoadTrackId = parseInt(id.split('_')[1]);
-        fileInput.click();
-      }
+      if (id.startsWith('load_')) { activeLoadTrackId = parseInt(id.split('_')[1]); fileInput.click(); }
       if (id.startsWith('del_')) {
-        const cId = id.split('_')[1];
-        const result = findClipById(cId);
+        const cId = id.split('_')[1]; const result = findClipById(cId);
         if (result) {
            result.track.clips = result.track.clips.filter(c => c.id !== cId);
            if (selectedClip && selectedClip.id === cId) selectedClip = null;
         }
         return; 
       }
-      if (id.startsWith('vol_')) {
-        isDraggingSlider = parseInt(id.split('_')[1]);
-        activeSliderType = 'vol';
-        updateSlider(mouseX, box);
-        return;
-      }
-      if (id.startsWith('rev_')) {
-        isDraggingSlider = parseInt(id.split('_')[1]);
-        activeSliderType = 'rev';
-        updateSlider(mouseX, box);
-        return;
-      }
-      if (id === 'scrollbar_thumb') {
-        isDraggingScrollbar = true;
-        scrollDragOffsetX = mouseX - box.x;
-        return;
-      }
+      if (id.startsWith('vol_')) { isDraggingSlider = parseInt(id.split('_')[1]); activeSliderType = 'vol'; updateSlider(mouseX, box); return; }
+      if (id.startsWith('rev_')) { isDraggingSlider = parseInt(id.split('_')[1]); activeSliderType = 'rev'; updateSlider(mouseX, box); return; }
+      if (id === 'scrollbar_thumb') { isDraggingScrollbar = true; scrollDragOffsetX = mouseX - box.x; return; }
       if (id === 'scrollbar_track' && !activeButtons['scrollbar_thumb'] || 
          (id === 'scrollbar_track' && (mouseX < activeButtons['scrollbar_thumb'].x || mouseX > activeButtons['scrollbar_thumb'].x + activeButtons['scrollbar_thumb'].w))) {
         
-        const totalWorldW = TOTAL_DURATION * zoomLevel;
-        const visibleWorldW = width - LEFT_PANEL_W;
+        const totalWorldW = TOTAL_DURATION * zoomLevel, visibleWorldW = width - LEFT_PANEL_W;
         const scrollbarTrackW = width - LEFT_PANEL_W;
         const thumbW = Math.max(30, (visibleWorldW / totalWorldW) * scrollbarTrackW);
-        
         let targetX = mouseX - LEFT_PANEL_W - (thumbW / 2);
         targetX = Math.max(0, Math.min(scrollbarTrackW - thumbW, targetX));
-        
         viewOffsetX = (targetX / (scrollbarTrackW - thumbW)) * (totalWorldW - visibleWorldW);
-        
-        isDraggingScrollbar = true;
-        scrollDragOffsetX = thumbW / 2;
-        return;
+        isDraggingScrollbar = true; scrollDragOffsetX = thumbW / 2; return;
       }
     }
   }
 
   if (!clickedButton && mouseX > LEFT_PANEL_W && mouseY > TOP_BAR_H && mouseY < height - SCROLLBAR_H) {
-    selectedClip = null;
-    const worldX = mouseX - LEFT_PANEL_W + viewOffsetX;
-    const rawTime = worldX / zoomLevel;
-    playheadTime = Math.max(0, getSnappedTime(rawTime));
+    selectedClip = null; const worldX = mouseX - LEFT_PANEL_W + viewOffsetX;
+    const rawTime = worldX / zoomLevel; playheadTime = Math.max(0, getSnappedTime(rawTime));
     if (isPlaying) { stopAudio(); playAudio(); }
   }
 });
@@ -964,125 +988,72 @@ window.addEventListener('mousedown', (e) => {
 function updateSlider(mx, box) {
   if (!isDraggingSlider) return;
   const track = tracks.find(t => t.id === isDraggingSlider);
-  let pct = (mx - box.x) / box.w;
-  pct = Math.max(0, Math.min(1, pct));
+  let pct = (mx - box.x) / box.w; pct = Math.max(0, Math.min(1, pct));
   
-  if (activeSliderType === 'vol') {
-    track.volume = pct * 2; 
-    if (track.gainNode) track.gainNode.gain.value = track.volume;
-  } else if (activeSliderType === 'rev') {
-    track.reverb = pct; 
-    if (track.wetGainNode) track.wetGainNode.gain.value = track.reverb;
-  }
+  if (activeSliderType === 'vol') { track.volume = pct * 2; if (track.gainNode) track.gainNode.gain.value = track.volume; }
+  else if (activeSliderType === 'rev') { track.reverb = pct; if (track.wetGainNode) track.wetGainNode.gain.value = track.reverb; }
   needsRender = true;
 }
 
 window.addEventListener('mousemove', (e) => {
-  mouseX = e.clientX;
-  mouseY = e.clientY;
-  needsRender = true;
+  mouseX = e.clientX; mouseY = e.clientY; needsRender = true;
+  if (isDraggingSlider) updateSlider(mouseX, activeButtons[`${activeSliderType}_${isDraggingSlider}`]);
   
-  if (isDraggingSlider) {
-    const box = activeButtons[`${activeSliderType}_${isDraggingSlider}`];
-    updateSlider(mouseX, box);
-  }
-
   if (isDraggingLoopStart) {
     const rawTime = (mouseX - LEFT_PANEL_W + viewOffsetX) / zoomLevel;
     loopStart = Math.max(0, Math.min(loopEnd - 0.1, getSnappedTime(rawTime)));
   }
-
   if (isDraggingLoopEnd) {
     const rawTime = (mouseX - LEFT_PANEL_W + viewOffsetX) / zoomLevel;
     loopEnd = Math.max(loopStart + 0.1, getSnappedTime(rawTime));
   }
-
   if (isDraggingTrim !== null) {
     const result = findClipById(isDraggingTrim);
     if (result) {
-      const clip = result.clip;
-      const worldX = mouseX - LEFT_PANEL_W + viewOffsetX;
-      const rawTime = worldX / zoomLevel;
-      
+      const clip = result.clip, rawTime = (mouseX - LEFT_PANEL_W + viewOffsetX) / zoomLevel;
       const snappedEndTime = Math.max(clip.startTime + 0.1, getSnappedTime(rawTime));
-      let newTrimDuration = snappedEndTime - clip.startTime;
-      newTrimDuration = Math.max(0.1, Math.min(clip.buffer.duration, newTrimDuration));
-      clip.trimDuration = newTrimDuration;
+      clip.trimDuration = Math.max(0.1, Math.min(clip.buffer.duration, snappedEndTime - clip.startTime));
     }
   }
-
   if (isDraggingClip !== null) {
-    const clip = isDraggingClip;
-    const worldX = mouseX - LEFT_PANEL_W + viewOffsetX;
-    const rawTime = (worldX / zoomLevel) - clipDragOffsetTime;
+    const clip = isDraggingClip, rawTime = ((mouseX - LEFT_PANEL_W + viewOffsetX) / zoomLevel) - clipDragOffsetTime;
     clip.startTime = Math.max(0, getSnappedTime(rawTime));
-
-    // CROSS-TRACK DRAGGING LOGIC
     if (mouseY > TOP_BAR_H + TIMELINE_H) {
-      const yOffset = mouseY - TOP_BAR_H - TIMELINE_H;
-      const targetTrackIndex = Math.floor(yOffset / (TRACK_H + 10));
-      
+      const targetTrackIndex = Math.floor((mouseY - TOP_BAR_H - TIMELINE_H) / (TRACK_H + 10));
       if (targetTrackIndex >= 0 && targetTrackIndex < tracks.length) {
         const targetTrack = tracks[targetTrackIndex];
         if (clip.trackId !== targetTrack.id) {
           const oldTrack = tracks.find(t => t.id === clip.trackId);
-          if (oldTrack) {
-            oldTrack.clips = oldTrack.clips.filter(c => c.id !== clip.id);
-            clip.trackId = targetTrack.id;
-            targetTrack.clips.push(clip);
-          }
+          if (oldTrack) { oldTrack.clips = oldTrack.clips.filter(c => c.id !== clip.id); clip.trackId = targetTrack.id; targetTrack.clips.push(clip); }
         }
       }
     }
   }
-  
   if (isDraggingScrollbar) {
-    const totalWorldW = TOTAL_DURATION * zoomLevel;
-    const visibleWorldW = width - LEFT_PANEL_W;
-    const scrollbarTrackW = width - LEFT_PANEL_W;
-    const thumbW = Math.max(30, (visibleWorldW / totalWorldW) * scrollbarTrackW);
-    
+    const totalWorldW = TOTAL_DURATION * zoomLevel, visibleWorldW = width - LEFT_PANEL_W;
+    const scrollbarTrackW = width - LEFT_PANEL_W, thumbW = Math.max(30, (visibleWorldW / totalWorldW) * scrollbarTrackW);
     let targetX = mouseX - LEFT_PANEL_W - scrollDragOffsetX;
     targetX = Math.max(0, Math.min(scrollbarTrackW - thumbW, targetX));
-    
     viewOffsetX = (targetX / (scrollbarTrackW - thumbW)) * (totalWorldW - visibleWorldW);
   }
 });
 
 window.addEventListener('mouseup', () => {
-  window.mouseIsDown = false;
-  isDraggingSlider = null;
-  activeSliderType = null;
-  isDraggingScrollbar = false;
-  isDraggingTrim = null;
-  isDraggingClip = null; 
-  isDraggingLoopStart = false;
-  isDraggingLoopEnd = false;
-  needsRender = true;
+  window.mouseIsDown = false; isDraggingSlider = null; activeSliderType = null;
+  isDraggingScrollbar = false; isDraggingTrim = null; isDraggingClip = null; 
+  isDraggingLoopStart = false; isDraggingLoopEnd = false; needsRender = true;
+  clearTimeout(bpmHoldTimeout); clearInterval(bpmHoldInterval);
 });
 
 canvas.addEventListener('wheel', (e) => {
-  e.preventDefault(); 
-  needsRender = true;
+  e.preventDefault(); needsRender = true;
   if (mouseX > LEFT_PANEL_W && mouseY > TOP_BAR_H) {
-    
     if (e.ctrlKey || e.shiftKey) {
-      const mouseWorldX_before = mouseX - LEFT_PANEL_W + viewOffsetX;
-      const timeAtMouse = mouseWorldX_before / zoomLevel;
-      
-      const zoomDelta = e.deltaY * -0.1;
-      zoomLevel = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomLevel + zoomDelta));
-      
-      const mouseWorldX_after = timeAtMouse * zoomLevel;
-      viewOffsetX = mouseWorldX_after - (mouseX - LEFT_PANEL_W);
-    } 
-    else {
-      viewOffsetX += Math.abs(e.deltaX) > 0 ? e.deltaX : e.deltaY;
-    }
-
-    viewOffsetX = Math.max(0, viewOffsetX);
-    const maxScroll = Math.max(0, (TOTAL_DURATION * zoomLevel) - (width - LEFT_PANEL_W));
-    viewOffsetX = Math.min(maxScroll, viewOffsetX);
+      const timeAtMouse = (mouseX - LEFT_PANEL_W + viewOffsetX) / zoomLevel;
+      zoomLevel = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomLevel + (e.deltaY * -0.1)));
+      viewOffsetX = (timeAtMouse * zoomLevel) - (mouseX - LEFT_PANEL_W);
+    } else { viewOffsetX += Math.abs(e.deltaX) > 0 ? e.deltaX : e.deltaY; }
+    viewOffsetX = Math.min(Math.max(0, (TOTAL_DURATION * zoomLevel) - (width - LEFT_PANEL_W)), Math.max(0, viewOffsetX));
   }
 }, { passive: false });
 

@@ -25,9 +25,8 @@
 
 <script>
 /**
- * PURE CANVAS 4-TRACK ENGINE v8.1
- * Hardware UI Overhaul, Chunky Faders, Latency Compensation
- * PERFORMANCE OPTIMIZED: State-based rendering
+ * PURE CANVAS 4-TRACK ENGINE v9.2
+ * Added Cross-Track Clip Dragging
  */
 
 const canvas = document.getElementById('app');
@@ -44,11 +43,13 @@ let lastDrawTime = 0;
 let animationFrameId;
 let currentBPM = 120;
 let isSnapEnabled = true; 
+let isGridEnabled = true; 
 
-// OPTIMIZATION: Render state flag
+let isLoopEnabled = false;
+let loopStart = 0;
+let loopEnd = 4; // Defaults to 4 seconds, adjust via dragging
+
 let needsRender = true;
-
-// LATENCY COMPENSATION STATE (in milliseconds)
 let globalLatencyMs = 150; 
 
 let viewOffsetX = 0; 
@@ -109,6 +110,8 @@ let scrollDragOffsetX = 0;
 let isDraggingTrim = null; 
 let isDraggingClip = null; 
 let clipDragOffsetTime = 0; 
+let isDraggingLoopStart = false;
+let isDraggingLoopEnd = false;
 
 function resize() {
   width = window.innerWidth;
@@ -329,13 +332,7 @@ fileInput.onchange = async (e) => {
   needsRender = true;
 };
 
-function playAudio() {
-  initAudioContext();
-  if (isPlaying) return;
-  isPlaying = true;
-  needsRender = true;
-  lastDrawTime = audioCtx.currentTime;
-  
+function scheduleClips() {
   tracks.forEach(track => {
     track.clips.forEach(clip => {
       clip.sourceNode = audioCtx.createBufferSource();
@@ -352,6 +349,15 @@ function playAudio() {
       }
     });
   });
+}
+
+function playAudio() {
+  initAudioContext();
+  if (isPlaying) return;
+  isPlaying = true;
+  needsRender = true;
+  lastDrawTime = audioCtx.currentTime;
+  scheduleClips();
 }
 
 function stopAudio() {
@@ -402,7 +408,6 @@ async function recordAudio() {
     const arrayBuffer = await blob.arrayBuffer();
     const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
     
-    // LATENCY COMPENSATION MATH: Offset the clip backwards by globalLatencyMs
     const latencyOffsetSeconds = globalLatencyMs / 1000;
     const compensatedStartTime = Math.max(0, currentRecordStartTime - latencyOffsetSeconds);
 
@@ -497,7 +502,6 @@ function drawMacroFader(id, x, y, w, h, value, color, label) {
 }
 
 function render() {
-  // OPTIMIZATION: Stop loop execution if nothing has changed and not actively playing
   if (!isPlaying && !isRecording && !needsRender) {
     requestAnimationFrame(render);
     return;
@@ -515,6 +519,24 @@ function render() {
     const now = audioCtx.currentTime;
     playheadTime += (now - lastDrawTime);
     lastDrawTime = now;
+    
+    // LOOP TICK LOGIC
+    if (isLoopEnabled && playheadTime >= loopEnd) {
+       playheadTime = loopStart;
+       // Stop all current playing nodes to re-sync
+       tracks.forEach(track => {
+         track.clips.forEach(clip => {
+           if (clip.sourceNode) {
+             try { clip.sourceNode.stop(); } catch(e) {}
+             clip.sourceNode.disconnect();
+             clip.sourceNode = null;
+           }
+         });
+       });
+       lastDrawTime = audioCtx.currentTime;
+       scheduleClips(); // Re-trigger nodes
+    }
+
     if (playheadTime > TOTAL_DURATION) { stopAudio(); playheadTime = 0; }
     
     if (isRecording && analyserNode) {
@@ -537,12 +559,29 @@ function render() {
   ctx.clip();
   ctx.translate(LEFT_PANEL_W - viewOffsetX, TOP_BAR_H);
 
-  ctx.fillStyle = '#060708';
+  const secondsPerBeat = 60 / currentBPM;
+  const secondsPerBar = secondsPerBeat * 4;
+
+  // BACKGROUND BAR SHADING
+  if (isGridEnabled) {
+    let barCount = 0;
+    for(let t = 0; t <= TOTAL_DURATION; t += secondsPerBar) {
+      const px = t * zoomLevel;
+      const bw = secondsPerBar * zoomLevel;
+      ctx.fillStyle = (barCount % 2 === 0) ? '#08090a' : '#0e1115';
+      ctx.fillRect(px, 0, bw, height);
+      barCount++;
+    }
+  } else {
+    ctx.fillStyle = '#08090a';
+    ctx.fillRect(0, 0, TOTAL_DURATION * zoomLevel, height);
+  }
+
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
   ctx.fillRect(0, 0, TOTAL_DURATION * zoomLevel, TIMELINE_H);
   ctx.strokeStyle = '#1a1c20';
   ctx.beginPath(); ctx.moveTo(0, TIMELINE_H); ctx.lineTo(TOTAL_DURATION * zoomLevel, TIMELINE_H); ctx.stroke();
 
-  const secondsPerBeat = 60 / currentBPM;
   let beatCount = 0;
   for(let t = 0; t <= TOTAL_DURATION; t += secondsPerBeat) {
     const px = t * zoomLevel;
@@ -556,10 +595,30 @@ function render() {
     beatCount++;
   }
 
+  // DRAW LOOP REGION & HANDLES
+  if (isLoopEnabled) {
+    const lx = loopStart * zoomLevel;
+    const lw = (loopEnd - loopStart) * zoomLevel;
+    
+    ctx.fillStyle = 'rgba(255, 0, 255, 0.15)';
+    ctx.fillRect(lx, 0, lw, height);
+    
+    ctx.fillStyle = '#ff00ff';
+    ctx.fillRect(lx, 0, 2, height);
+    ctx.fillRect(lx + lw - 2, 0, 2, height);
+
+    activeButtons['loop_start'] = { x: lx - 8, y: 0, w: 16, h: TIMELINE_H, isWorld: true };
+    activeButtons['loop_end'] = { x: lx + lw - 8, y: 0, w: 16, h: TIMELINE_H, isWorld: true };
+
+    ctx.beginPath();
+    ctx.moveTo(lx, 5); ctx.lineTo(lx + 10, 5); ctx.lineTo(lx, 15); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(lx + lw, 5); ctx.lineTo(lx + lw - 10, 5); ctx.lineTo(lx + lw, 15); ctx.fill();
+  }
+
   tracks.forEach((track, i) => {
     const trackY = TIMELINE_H + (i * (TRACK_H + 10));
-    ctx.fillStyle = '#0a0b0d';
-    ctx.fillRect(0, trackY, TOTAL_DURATION * zoomLevel, TRACK_H);
+    
     ctx.strokeStyle = '#15171a';
     ctx.strokeRect(0, trackY, TOTAL_DURATION * zoomLevel, TRACK_H);
     
@@ -720,28 +779,30 @@ function render() {
   drawSquareButton('stop', 100, 15, 70, 40, "■ STOP", false, "");
   drawSquareButton('rec', 180, 15, 80, 40, "● REC", isRecording, "#ff0033");
   
-  drawSquareButton('bpm_down', 280, 15, 30, 40, "<", false, "");
+  drawSquareButton('bpm_down', 275, 15, 30, 40, "<", false, "");
   ctx.fillStyle = '#050505';
-  drawRect(315, 15, 70, 40, 4);
+  drawRect(310, 15, 70, 40, 4);
   ctx.fillStyle = '#00e5ff';
   ctx.font = '14px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText(`${currentBPM} BPM`, 350, 35);
-  drawSquareButton('bpm_up', 390, 15, 30, 40, ">", false, "");
+  ctx.fillText(`${currentBPM} BPM`, 345, 35);
+  drawSquareButton('bpm_up', 385, 15, 30, 40, ">", false, "");
 
-  drawSquareButton('snap', 435, 15, 80, 40, isSnapEnabled ? "SNAP ON" : "SNAP OFF", isSnapEnabled, "#00aaff");
+  drawSquareButton('snap', 430, 15, 80, 40, isSnapEnabled ? "SNAP ON" : "SNAP OFF", isSnapEnabled, "#00aaff");
+  drawSquareButton('grid', 520, 15, 80, 40, isGridEnabled ? "GRID ON" : "GRID OFF", isGridEnabled, "#00aaff");
 
-  drawSquareButton('lat_down', 530, 15, 30, 40, "<", false, "");
+  drawSquareButton('lat_down', 615, 15, 30, 40, "<", false, "");
   ctx.fillStyle = '#050505';
-  drawRect(565, 15, 80, 40, 4);
+  drawRect(650, 15, 80, 40, 4);
   ctx.fillStyle = '#ffcc00';
   ctx.font = '11px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText(`LATENCY`, 605, 25);
-  ctx.fillText(`${globalLatencyMs}ms`, 605, 40);
-  drawSquareButton('lat_up', 650, 15, 30, 40, ">", false, "");
+  ctx.fillText(`LATENCY`, 690, 25);
+  ctx.fillText(`${globalLatencyMs}ms`, 690, 40);
+  drawSquareButton('lat_up', 735, 15, 30, 40, ">", false, "");
 
-  drawSquareButton('mixdown', 700, 15, 90, 40, isMixing ? "MIXING..." : "MIXDOWN", isMixing, "#ff9900");
+  drawSquareButton('loop', 780, 15, 80, 40, isLoopEnabled ? "LOOP ON" : "LOOP OFF", isLoopEnabled, "#ff00ff");
+  drawSquareButton('mixdown', 875, 15, 90, 40, isMixing ? "MIXING..." : "MIXDOWN", isMixing, "#ff9900");
 
   ctx.fillStyle = '#fff';
   ctx.font = 'bold 24px monospace';
@@ -783,13 +844,33 @@ window.addEventListener('mousedown', (e) => {
       if (id === 'rec') recordAudio();
       if (id === 'mixdown') exportMixdown();
       if (id === 'snap') { isSnapEnabled = !isSnapEnabled; }
+      if (id === 'grid') { isGridEnabled = !isGridEnabled; }
+      if (id === 'loop') { 
+        isLoopEnabled = !isLoopEnabled; 
+        if (isLoopEnabled && playheadTime > loopEnd) playheadTime = loopStart;
+      }
       
-      if (id === 'bpm_down') { currentBPM = Math.max(40, currentBPM - 1); }
-      if (id === 'bpm_up') { currentBPM = Math.min(300, currentBPM + 1); }
+      if (id === 'bpm_down') { 
+        currentBPM = Math.max(40, currentBPM - 1);
+        loopEnd = loopStart + (60 / currentBPM) * 4; 
+      }
+      if (id === 'bpm_up') { 
+        currentBPM = Math.min(300, currentBPM + 1); 
+        loopEnd = loopStart + (60 / currentBPM) * 4;
+      }
       
       if (id === 'lat_down') { globalLatencyMs = Math.max(0, globalLatencyMs - 10); }
       if (id === 'lat_up') { globalLatencyMs = Math.min(1000, globalLatencyMs + 10); }
       
+      if (id === 'loop_start') {
+        isDraggingLoopStart = true;
+        return;
+      }
+      if (id === 'loop_end') {
+        isDraggingLoopEnd = true;
+        return;
+      }
+
       if (id.startsWith('color_')) {
         activeColorTrackId = parseInt(id.split('_')[1]);
         const t = tracks.find(t => t.id === activeColorTrackId);
@@ -906,6 +987,16 @@ window.addEventListener('mousemove', (e) => {
     updateSlider(mouseX, box);
   }
 
+  if (isDraggingLoopStart) {
+    const rawTime = (mouseX - LEFT_PANEL_W + viewOffsetX) / zoomLevel;
+    loopStart = Math.max(0, Math.min(loopEnd - 0.1, getSnappedTime(rawTime)));
+  }
+
+  if (isDraggingLoopEnd) {
+    const rawTime = (mouseX - LEFT_PANEL_W + viewOffsetX) / zoomLevel;
+    loopEnd = Math.max(loopStart + 0.1, getSnappedTime(rawTime));
+  }
+
   if (isDraggingTrim !== null) {
     const result = findClipById(isDraggingTrim);
     if (result) {
@@ -925,6 +1016,24 @@ window.addEventListener('mousemove', (e) => {
     const worldX = mouseX - LEFT_PANEL_W + viewOffsetX;
     const rawTime = (worldX / zoomLevel) - clipDragOffsetTime;
     clip.startTime = Math.max(0, getSnappedTime(rawTime));
+
+    // CROSS-TRACK DRAGGING LOGIC
+    if (mouseY > TOP_BAR_H + TIMELINE_H) {
+      const yOffset = mouseY - TOP_BAR_H - TIMELINE_H;
+      const targetTrackIndex = Math.floor(yOffset / (TRACK_H + 10));
+      
+      if (targetTrackIndex >= 0 && targetTrackIndex < tracks.length) {
+        const targetTrack = tracks[targetTrackIndex];
+        if (clip.trackId !== targetTrack.id) {
+          const oldTrack = tracks.find(t => t.id === clip.trackId);
+          if (oldTrack) {
+            oldTrack.clips = oldTrack.clips.filter(c => c.id !== clip.id);
+            clip.trackId = targetTrack.id;
+            targetTrack.clips.push(clip);
+          }
+        }
+      }
+    }
   }
   
   if (isDraggingScrollbar) {
@@ -947,6 +1056,8 @@ window.addEventListener('mouseup', () => {
   isDraggingScrollbar = false;
   isDraggingTrim = null;
   isDraggingClip = null; 
+  isDraggingLoopStart = false;
+  isDraggingLoopEnd = false;
   needsRender = true;
 });
 
